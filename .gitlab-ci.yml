@@ -1,0 +1,311 @@
+stages:
+  - build
+  - push-to-nexus
+  - deploy-ariflow-server-131
+  - deploy-ariflow-server-130
+  - rollback
+
+variables:
+  NEXUS_REGISTRY: "nexus.yourcompany.com:8443"  # Update with your Nexus Docker registry
+  IMAGE_NAME: "airflow-custom"
+  # Use CI_COMMIT_SHORT_SHA for versioning, fallback to 'latest' for manual runs
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA:-latest}"
+  IMAGE_FULL_PATH: "${NEXUS_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+  # Keep last 5 versions for rollback
+  ROLLBACK_RETENTION: "5"
+
+# -----------------------------
+# Build Custom Airflow Image
+# -----------------------------
+build-airflow-image:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker info
+  script:
+    - echo "🔨 Building custom Airflow image..."
+    - |
+      docker build \
+        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+        -t ${IMAGE_NAME}:latest \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=${CI_COMMIT_SHORT_SHA} \
+        -f airflow/docker/Dockerfile \
+        airflow/
+    - echo "✅ Image built successfully"
+    - docker images | grep ${IMAGE_NAME}
+    # Save image as artifact for next stage
+    - docker save ${IMAGE_NAME}:${IMAGE_TAG} -o airflow-image.tar
+    - docker save ${IMAGE_NAME}:latest -o airflow-image-latest.tar
+  artifacts:
+    paths:
+      - airflow-image.tar
+      - airflow-image-latest.tar
+    expire_in: 1 hour
+  only:
+    changes:
+      - airflow/docker/Dockerfile
+      - airflow/requirements.txt
+      - airflow/docker/docker-compose-server-*.yaml
+      - airflow/config/airflow.cfg
+      - airflow/airflow-ci.yml
+
+# -----------------------------
+# Push to Nexus Registry
+# -----------------------------
+push-to-nexus:
+  stage: push-to-nexus
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker info
+  script:
+    - echo "📦 Loading built image..."
+    - docker load -i airflow-image.tar
+    - docker load -i airflow-image-latest.tar
+    
+    - echo "🔐 Logging into Nexus registry..."
+    - echo ${NEXUS_PASSWORD} | docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin
+    
+    - echo "⬆️ Tagging and pushing image to Nexus..."
+    # Tag with commit SHA
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${NEXUS_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${NEXUS_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+    
+    # Tag with 'latest'
+    - docker tag ${IMAGE_NAME}:latest ${NEXUS_REGISTRY}/${IMAGE_NAME}:latest
+    - docker push ${NEXUS_REGISTRY}/${IMAGE_NAME}:latest
+    
+    # Tag with branch name (for feature branches)
+    - |
+      if [ "${CI_COMMIT_BRANCH}" != "" ]; then
+        BRANCH_TAG=$(echo ${CI_COMMIT_BRANCH} | sed 's/\//-/g')
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${NEXUS_REGISTRY}/${IMAGE_NAME}:${BRANCH_TAG}
+        docker push ${NEXUS_REGISTRY}/${IMAGE_NAME}:${BRANCH_TAG}
+      fi
+    
+    - echo "✅ Image pushed to Nexus: ${IMAGE_FULL_PATH}"
+    
+    # Create deployment metadata file
+    - |
+      cat > deployment-metadata.json <<EOF
+      {
+        "image": "${IMAGE_FULL_PATH}",
+        "tag": "${IMAGE_TAG}",
+        "commit": "${CI_COMMIT_SHA}",
+        "branch": "${CI_COMMIT_BRANCH}",
+        "pipeline_id": "${CI_PIPELINE_ID}",
+        "deployed_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+      }
+      EOF
+    - cat deployment-metadata.json
+  artifacts:
+    paths:
+      - deployment-metadata.json
+    expire_in: 30 days
+  dependencies:
+    - build-airflow-image
+
+# -----------------------------
+# Deploy Server 131 (MySQL + Scheduler2)
+# -----------------------------
+deploy-ariflow-server-131:
+  stage: deploy-ariflow-server-131
+  script:
+    - echo "🚀 Deploying Airflow on Server 131 (172.10.17.131) with Nexus image..."
+    - export DEPLOY_IMAGE="${NEXUS_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.131 "
+        echo '===== Login to Nexus Docker Registry =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        
+        echo '===== Pulling latest image from Nexus =====' &&
+        sudo -u developer docker pull ${DEPLOY_IMAGE} &&
+        
+        echo '===== Backing up current deployment metadata =====' &&
+        sudo -u developer mkdir -p /data/airflow-deployments &&
+        if [ -f /data/airflow-deployments/current-deployment-131.json ]; then
+          sudo -u developer cp /data/airflow-deployments/current-deployment-131.json /data/airflow-deployments/previous-deployment-131.json
+        fi &&
+        
+        echo '===== Saving new deployment metadata =====' &&
+        echo '{\"image\":\"${DEPLOY_IMAGE}\",\"tag\":\"${IMAGE_TAG}\",\"commit\":\"${CI_COMMIT_SHA}\",\"deployed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"pipeline_id\":\"${CI_PIPELINE_ID}\"}' | sudo -u developer tee /data/airflow-deployments/current-deployment-131.json > /dev/null &&
+        
+        echo '===== Updating docker-compose with new image =====' &&
+        sudo -u developer sed -i 's|image:.*airflow.*|image: ${DEPLOY_IMAGE}|g' /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml &&
+        
+        echo '===== Deploying docker-compose =====' &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml up -d &&
+        
+        echo '===== Cleaning up old images (keeping last ${ROLLBACK_RETENTION}) =====' &&
+        sudo -u developer docker images ${NEXUS_REGISTRY}/${IMAGE_NAME} --format '{{.Tag}} {{.ID}}' | grep -v latest | tail -n +$((${ROLLBACK_RETENTION} + 1)) | awk '{print \$2}' | xargs -r sudo -u developer docker rmi -f || true &&
+        
+        echo '✅ Deployment completed on Server 131'
+      "
+  dependencies:
+    - push-to-nexus
+  rules:
+    - changes:
+        - airflow/docker/docker-compose-server-131.yaml
+        - airflow/config/airflow.cfg
+        - airflow/airflow-ci.yml
+        - airflow/docker/Dockerfile
+        - airflow/requirements.txt
+
+# -----------------------------
+# Deploy Server 130 (Webserver + Scheduler1)
+# -----------------------------
+deploy-ariflow-server-130:
+  stage: deploy-ariflow-server-130
+  script:
+    - echo "🚀 Deploying Airflow on Server 130 (172.10.17.130) with Nexus image..."
+    - export DEPLOY_IMAGE="${NEXUS_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.130 "
+        echo '===== Login to Nexus Docker Registry =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        
+        echo '===== Pulling latest image from Nexus =====' &&
+        sudo -u developer docker pull ${DEPLOY_IMAGE} &&
+        
+        echo '===== Backing up current deployment metadata =====' &&
+        sudo -u developer mkdir -p /data/airflow-deployments &&
+        if [ -f /data/airflow-deployments/current-deployment-130.json ]; then
+          sudo -u developer cp /data/airflow-deployments/current-deployment-130.json /data/airflow-deployments/previous-deployment-130.json
+        fi &&
+        
+        echo '===== Saving new deployment metadata =====' &&
+        echo '{\"image\":\"${DEPLOY_IMAGE}\",\"tag\":\"${IMAGE_TAG}\",\"commit\":\"${CI_COMMIT_SHA}\",\"deployed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"pipeline_id\":\"${CI_PIPELINE_ID}\"}' | sudo -u developer tee /data/airflow-deployments/current-deployment-130.json > /dev/null &&
+        
+        echo '===== Updating docker-compose with new image =====' &&
+        sudo -u developer sed -i 's|image:.*airflow.*|image: ${DEPLOY_IMAGE}|g' /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml &&
+        
+        echo '===== Deploying docker-compose =====' &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml up -d &&
+        
+        echo '===== Cleaning up old images (keeping last ${ROLLBACK_RETENTION}) =====' &&
+        sudo -u developer docker images ${NEXUS_REGISTRY}/${IMAGE_NAME} --format '{{.Tag}} {{.ID}}' | grep -v latest | tail -n +$((${ROLLBACK_RETENTION} + 1)) | awk '{print \$2}' | xargs -r sudo -u developer docker rmi -f || true &&
+        
+        echo '✅ Deployment completed on Server 130'
+      "
+  dependencies:
+    - push-to-nexus
+  rules:
+    - changes:
+        - airflow/docker/docker-compose-server-130.yaml
+        - airflow/config/airflow.cfg
+        - airflow/airflow-ci.yml
+        - airflow/docker/Dockerfile
+        - airflow/requirements.txt
+
+# -----------------------------
+# Rollback Jobs (Manual Trigger)
+# -----------------------------
+rollback-server-131:
+  stage: rollback
+  when: manual
+  script:
+    - echo "🔄 Rolling back Server 131 to previous deployment..."
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.131 "
+        echo '===== Reading previous deployment metadata =====' &&
+        if [ ! -f /data/airflow-deployments/previous-deployment-131.json ]; then
+          echo '❌ No previous deployment found for rollback!'
+          exit 1
+        fi &&
+        
+        ROLLBACK_IMAGE=\$(sudo -u developer cat /data/airflow-deployments/previous-deployment-131.json | grep -o '\"image\":\"[^\"]*\"' | cut -d'\"' -f4) &&
+        echo \"Rolling back to image: \$ROLLBACK_IMAGE\" &&
+        
+        echo '===== Login to Nexus Docker Registry =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        
+        echo '===== Pulling rollback image =====' &&
+        sudo -u developer docker pull \$ROLLBACK_IMAGE &&
+        
+        echo '===== Updating docker-compose with rollback image =====' &&
+        sudo -u developer sed -i \"s|image:.*airflow.*|image: \$ROLLBACK_IMAGE|g\" /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml &&
+        
+        echo '===== Deploying docker-compose with rollback image =====' &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml up -d &&
+        
+        echo '===== Swapping deployment metadata =====' &&
+        sudo -u developer cp /data/airflow-deployments/previous-deployment-131.json /data/airflow-deployments/current-deployment-131.json &&
+        
+        echo \"✅ Rollback completed on Server 131 to \$ROLLBACK_IMAGE\"
+      "
+
+rollback-server-130:
+  stage: rollback
+  when: manual
+  script:
+    - echo "🔄 Rolling back Server 130 to previous deployment..."
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.130 "
+        echo '===== Reading previous deployment metadata =====' &&
+        if [ ! -f /data/airflow-deployments/previous-deployment-130.json ]; then
+          echo '❌ No previous deployment found for rollback!'
+          exit 1
+        fi &&
+        
+        ROLLBACK_IMAGE=\$(sudo -u developer cat /data/airflow-deployments/previous-deployment-130.json | grep -o '\"image\":\"[^\"]*\"' | cut -d'\"' -f4) &&
+        echo \"Rolling back to image: \$ROLLBACK_IMAGE\" &&
+        
+        echo '===== Login to Nexus Docker Registry =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        
+        echo '===== Pulling rollback image =====' &&
+        sudo -u developer docker pull \$ROLLBACK_IMAGE &&
+        
+        echo '===== Updating docker-compose with rollback image =====' &&
+        sudo -u developer sed -i \"s|image:.*airflow.*|image: \$ROLLBACK_IMAGE|g\" /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml &&
+        
+        echo '===== Deploying docker-compose with rollback image =====' &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml up -d &&
+        
+        echo '===== Swapping deployment metadata =====' &&
+        sudo -u developer cp /data/airflow-deployments/previous-deployment-130.json /data/airflow-deployments/current-deployment-130.json &&
+        
+        echo \"✅ Rollback completed on Server 130 to \$ROLLBACK_IMAGE\"
+      "
+
+# Advanced rollback to specific version
+rollback-to-version:
+  stage: rollback
+  when: manual
+  variables:
+    ROLLBACK_TAG: ""  # Set this manually when triggering the job
+  script:
+    - |
+      if [ -z "$ROLLBACK_TAG" ]; then
+        echo "❌ ROLLBACK_TAG variable must be set!"
+        echo "Example: ROLLBACK_TAG=abc123def"
+        exit 1
+      fi
+    - echo "🔄 Rolling back both servers to version: ${ROLLBACK_TAG}"
+    - export ROLLBACK_IMAGE="${NEXUS_REGISTRY}/${IMAGE_NAME}:${ROLLBACK_TAG}"
+    
+    # Server 131
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.131 "
+        echo '===== Server 131: Rolling back to ${ROLLBACK_IMAGE} =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        sudo -u developer docker pull ${ROLLBACK_IMAGE} &&
+        sudo -u developer sed -i 's|image:.*airflow.*|image: ${ROLLBACK_IMAGE}|g' /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-131.yaml up -d &&
+        echo '✅ Server 131 rolled back'
+      "
+    
+    # Server 130
+    - |
+      ssh -p3535 -i /home/dataeng99/.ssh/dataeng99_id_rsa dataeng99@172.10.17.130 "
+        echo '===== Server 130: Rolling back to ${ROLLBACK_IMAGE} =====' &&
+        echo '${NEXUS_PASSWORD}' | sudo -u developer docker login ${NEXUS_REGISTRY} -u ${NEXUS_USERNAME} --password-stdin &&
+        sudo -u developer docker pull ${ROLLBACK_IMAGE} &&
+        sudo -u developer sed -i 's|image:.*airflow.*|image: ${ROLLBACK_IMAGE}|g' /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml &&
+        sudo -u developer /data/binaries/docker-compose -f /data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow/docker/docker-compose-server-130.yaml up -d &&
+        echo '✅ Server 130 rolled back'
+      "

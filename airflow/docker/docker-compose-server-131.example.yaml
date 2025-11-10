@@ -1,0 +1,85 @@
+# Example Docker Compose for Server 131 (MySQL + Scheduler2)
+# Replace with your actual configuration
+
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  # IMPORTANT: This image reference will be automatically updated by CI/CD pipeline
+  image: nexus.yourcompany.com:8443/airflow-custom:latest
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=mysql+pymysql://airflow:password@localhost:3306/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+mysql://airflow:password@localhost:3306/airflow
+    - AIRFLOW__CELERY__BROKER_URL=redis://localhost:6379/0
+    - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY}
+    - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+    - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  volumes:
+    - /data/airflow/dags:/opt/airflow/dags
+    - /data/airflow/logs:/opt/airflow/logs
+    - /data/airflow/plugins:/opt/airflow/plugins
+    - /data/airflow/config/airflow.cfg:/opt/airflow/airflow.cfg
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - airflow-network
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: airflow-mysql-131
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=airflow
+      - MYSQL_USER=airflow
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - /data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - airflow-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: airflow-redis-131
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - airflow-network
+
+  airflow-scheduler-2:
+    <<: *airflow-common
+    container_name: airflow-scheduler-2-131
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+networks:
+  airflow-network:
+    driver: bridge
+
+# NOTE: The image tag will be automatically updated during deployment
+# by the CI/CD pipeline to use the specific commit SHA

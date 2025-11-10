@@ -1,0 +1,13 @@
+# Custom Python packages for Airflow
+# Add your additional requirements here
+
+# Example packages:
+pandas>=1.5.0
+numpy>=1.23.0
+sqlalchemy>=1.4.0
+pymysql>=1.0.0
+requests>=2.28.0
+
+# Airflow providers (if not already included in base image)
+# apache-airflow-providers-mysql>=5.0.0
+# apache-airflow-providers-postgres>=5.0.0
