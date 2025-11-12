@@ -17,16 +17,23 @@ This deployment solution provides:
 
 ```
 .
-├── airflow-ci.yml                    # GitLab CI/CD pipeline (8 stages)
-├── Dockerfile                        # Custom Airflow image definition
-├── docker-compose-server-130.yaml   # Server 130: Webserver + Scheduler 1
-├── docker-compose-server-131.yaml   # Server 131: MySQL + Scheduler 2
-├── deploy-helper.sh                 # Manual deployment utility script
-├── .env.example                     # Environment variables template
-├── DEPLOYMENT_GUIDE.md              # Complete deployment documentation
-├── IMPROVEMENTS_SUMMARY.md          # All improvements and recommendations
-├── QUICK_REFERENCE.md               # Quick command reference
-└── README.md                        # This file
+├── airflow-ci.yml                        # GitLab CI/CD pipeline - SSH transfer (default)
+├── airflow-ci-nexus.yml                  # GitLab CI/CD pipeline - Nexus registry (recommended)
+├── airflow-ci-separate-builds.yml        # GitLab CI/CD pipeline - separate builds (alternative)
+├── Dockerfile                            # Custom Airflow image definition
+├── docker-compose-server-130.yaml       # Server 130: Webserver + Scheduler 1
+├── docker-compose-server-131.yaml       # Server 131: MySQL + Scheduler 2
+├── deploy-helper.sh                     # Manual deployment utility script
+├── .env.example                         # Environment variables template
+├── DEPLOYMENT_GUIDE.md                  # Complete deployment documentation
+├── IMPROVEMENTS_SUMMARY.md              # All improvements and recommendations
+├── IMAGE_BUILD_COMPARISON.md            # Comparison of build strategies
+├── NEXUS_APPROACH_GUIDE.md              # Nexus registry approach (recommended)
+├── WHICH_APPROACH_TO_USE.md             # Decision guide - which strategy to use
+├── EXECUTIVE_SUMMARY.md                 # Executive summary of entire solution
+├── QUICK_REFERENCE.md                   # Quick command reference
+├── SETUP_CHECKLIST.md                   # Setup checklist
+└── README.md                            # This file
 ```
 
 ## 🚀 Quick Start
@@ -44,19 +51,55 @@ Update these key variables:
 - `SERVER_131_HOST` / `SERVER_130_HOST` - Server IPs
 - `SSH_USER` / `SSH_KEY` - SSH credentials
 
-### 2. Set Up GitLab CI/CD
+### 2. Choose Deployment Strategy
 
-1. Copy `airflow-ci.yml` to your repository
-2. Configure GitLab CI/CD variables:
-   - `NEXUS_USERNAME`
-   - `NEXUS_PASSWORD`
-3. Commit and push to trigger pipeline
+**Three approaches available:**
 
-### 3. Deploy
+#### Option 1: Nexus Registry (⭐ Recommended)
+```bash
+# Use Nexus as central image registry
+cp airflow-ci-nexus.yml .gitlab-ci.yml
+```
+- Best for production
+- Enterprise-grade
+- Easy to scale
+
+#### Option 2: Direct Transfer (Default)
+```bash
+# Transfer image via SSH from 131 to 130
+cp airflow-ci.yml .gitlab-ci.yml
+```
+- Simple setup
+- No external dependencies
+- Good for small deployments
+
+#### Option 3: Separate Builds
+```bash
+# Build on each server independently
+cp airflow-ci-separate-builds.yml .gitlab-ci.yml
+```
+- For geographically distant servers
+- Complete independence
+
+See [IMAGE_BUILD_COMPARISON.md](./IMAGE_BUILD_COMPARISON.md) for detailed comparison.
+
+### 3. Set Up GitLab CI/CD
+
+Configure GitLab CI/CD variables (Settings → CI/CD → Variables):
+
+**For Nexus approach:**
+   - `NEXUS_REGISTRY` - Your Nexus URL
+   - `NEXUS_USERNAME` - Nexus service account
+   - `NEXUS_PASSWORD` - Password (masked)
+
+**For all approaches:**
+   - Update variables in chosen CI file if needed
+
+### 4. Deploy
 
 **Automatic (via CI/CD)**:
 - Push changes to trigger automatic deployment
-- Pipeline runs through 8 stages
+- Pipeline runs through 8-9 stages
 - Automatic rollback on failure
 
 **Manual (via helper script)**:
@@ -76,7 +119,12 @@ chmod +x deploy-helper.sh
 
 | Document | Description |
 |----------|-------------|
+| [**EXECUTIVE_SUMMARY.md**](./EXECUTIVE_SUMMARY.md) | 📋 **Start Here**: Complete overview of the solution |
+| [**WHICH_APPROACH_TO_USE.md**](./WHICH_APPROACH_TO_USE.md) | 🎯 **Decision Guide**: Which deployment strategy to choose |
+| [**NEXUS_APPROACH_GUIDE.md**](./NEXUS_APPROACH_GUIDE.md) | ⭐ **Recommended**: Nexus registry approach - production best practice |
 | [**DEPLOYMENT_GUIDE.md**](./DEPLOYMENT_GUIDE.md) | Complete guide to deployment strategy, stages, and troubleshooting |
+| [**IMAGE_BUILD_COMPARISON.md**](./IMAGE_BUILD_COMPARISON.md) | Comparison of all three build strategies |
+| [**SETUP_CHECKLIST.md**](./SETUP_CHECKLIST.md) | Step-by-step setup checklist |
 | [**QUICK_REFERENCE.md**](./QUICK_REFERENCE.md) | Quick command reference and common operations |
 | [**IMPROVEMENTS_SUMMARY.md**](./IMPROVEMENTS_SUMMARY.md) | All improvements, recommendations, and best practices |
 

@@ -1,0 +1,652 @@
+variables:
+  IMAGE_NAME: "airflow-custom"
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  NEXUS_REGISTRY: "your-nexus-registry.com"  # Update with your Nexus URL
+  NEXUS_REPO: "docker-releases"
+  NEXUS_TEMP_REPO: "docker-temp"  # Optional: separate repo for temp images
+  SERVER_131_HOST: "172.10.17.131"
+  SERVER_130_HOST: "172.10.17.130"
+  SSH_PORT: "3535"
+  SSH_USER: "dataeng99"
+  SSH_KEY: "/home/dataeng99/.ssh/dataeng99_id_rsa"
+  DEPLOY_USER: "developer"
+  CODE_BASE_PATH: "/data/code/99acres_analytics/data_lake_tools/data-platform-applications/airflow"
+  DOCKER_COMPOSE_BIN: "/data/binaries/docker-compose"
+  
+stages:
+  - validate
+  - backup
+  - update-code
+  - build-and-push
+  - deploy-server-131
+  - deploy-server-130
+  - promote-image
+  - cleanup-temp
+  - rollback
+
+# =============================================================================
+# Stage 1: Validate Docker and Configuration
+# =============================================================================
+validate-docker-config:
+  stage: validate
+  script:
+    - echo "🔍 Validating Dockerfile and docker-compose files..."
+    - |
+      if [ ! -f "airflow/docker/Dockerfile" ]; then
+        echo "❌ Dockerfile not found!"
+        exit 1
+      fi
+      
+      if [ ! -f "airflow/docker/docker-compose-server-130.yaml" ] || [ ! -f "airflow/docker/docker-compose-server-131.yaml" ]; then
+        echo "❌ Docker-compose files not found!"
+        exit 1
+      fi
+      
+      echo "✅ All configuration files present"
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 2: Backup Current State
+# =============================================================================
+backup-current-state:
+  stage: backup
+  script:
+    - echo "💾 Backing up current deployment state..."
+    - |
+      BACKUP_FILE="deployment_backup_${CI_COMMIT_SHORT_SHA}.txt"
+      
+      # Backup Server 131 state
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        echo '=== Server 131 Current State ===' > /tmp/${BACKUP_FILE}
+        sudo -u ${DEPLOY_USER} docker images | grep '${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}' | grep 'stable' | head -1 >> /tmp/${BACKUP_FILE} || echo 'No stable image found' >> /tmp/${BACKUP_FILE}
+        sudo -u ${DEPLOY_USER} docker ps -a --filter 'name=airflow' --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' >> /tmp/${BACKUP_FILE}
+        echo 'COMMIT_SHA='${CI_COMMIT_SHORT_SHA} >> /tmp/${BACKUP_FILE}
+      "
+      
+      # Backup Server 130 state
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        echo '=== Server 130 Current State ===' >> /tmp/${BACKUP_FILE}
+        sudo -u ${DEPLOY_USER} docker images | grep '${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}' | grep 'stable' | head -1 >> /tmp/${BACKUP_FILE} || echo 'No stable image found' >> /tmp/${BACKUP_FILE}
+        sudo -u ${DEPLOY_USER} docker ps -a --filter 'name=airflow' --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' >> /tmp/${BACKUP_FILE}
+      "
+      
+      echo "✅ Backup metadata created: ${BACKUP_FILE}"
+  artifacts:
+    paths:
+      - deployment_backup_*.txt
+    expire_in: 30 days
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 3: Update Code on Both Servers
+# =============================================================================
+update-code-servers:
+  stage: update-code
+  script:
+    - echo "📦 Updating code on both servers..."
+    - |
+      # Update code on Server 131
+      echo "Updating Server 131..."
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        git fetch origin &&
+        git checkout ${CI_COMMIT_SHA} &&
+        echo '✅ Server 131 code updated to commit ${CI_COMMIT_SHA}'
+      " || { echo "❌ Failed to update code on Server 131"; exit 1; }
+      
+      # Update code on Server 130
+      echo "Updating Server 130..."
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        git fetch origin &&
+        git checkout ${CI_COMMIT_SHA} &&
+        echo '✅ Server 130 code updated to commit ${CI_COMMIT_SHA}'
+      " || { echo "❌ Failed to update code on Server 130"; exit 1; }
+      
+      echo "✅ Code updated on both servers"
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 4: Build Image and Push to Nexus (Temp)
+# =============================================================================
+build-and-push-temp-image:
+  stage: build-and-push
+  script:
+    - echo "🏗️ Building Docker image on Server 131 and pushing to Nexus..."
+    - |
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        cd ${CODE_BASE_PATH}/docker &&
+        
+        # Login to Nexus
+        echo '🔐 Logging into Nexus registry...'
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY} || { echo '❌ Failed to login to Nexus'; exit 1; }
+        
+        # Build the custom image
+        echo '🏗️ Building Docker image...'
+        sudo -u ${DEPLOY_USER} docker build \
+          --build-arg BUILD_DATE=\"\$(date -u +'%Y-%m-%dT%H:%M:%SZ')\" \
+          --build-arg VCS_REF=\"${CI_COMMIT_SHORT_SHA}\" \
+          --build-arg VERSION=\"${IMAGE_TAG}\" \
+          -t ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp \
+          -f Dockerfile . || { echo '❌ Docker build failed'; exit 1; }
+        
+        # Verify image was built
+        if ! sudo -u ${DEPLOY_USER} docker images | grep -q '${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}.*${IMAGE_TAG}-temp'; then
+          echo '❌ Docker image not found after build'
+          exit 1
+        fi
+        
+        echo '✅ Docker image built successfully'
+        
+        # Push temp image to Nexus
+        echo '📤 Pushing temp image to Nexus...'
+        sudo -u ${DEPLOY_USER} docker push \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp || { 
+          echo '❌ Failed to push image to Nexus'; 
+          exit 1; 
+        }
+        
+        echo '✅ Image pushed to Nexus: ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp'
+        
+        # Tag locally for easier reference
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp \
+          ${IMAGE_NAME}:${IMAGE_TAG}-temp
+      " || { echo "❌ Failed to build and push image"; exit 1; }
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 5: Deploy and Health Check on Server 131
+# =============================================================================
+deploy-server-131:
+  stage: deploy-server-131
+  script:
+    - echo "🚀 Deploying Airflow on Server 131..."
+    - |
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        
+        # Set environment variables for docker-compose
+        export CUSTOM_IMAGE_NAME='${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}'
+        export CUSTOM_IMAGE_TAG='${IMAGE_TAG}-temp'
+        
+        # Image is already local from build step, no need to pull
+        echo '✅ Using locally built image'
+        
+        # Stop existing containers
+        echo '⏸️ Stopping existing containers...'
+        sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+          -f docker/docker-compose-server-131.yaml down || true
+        
+        # Start new containers
+        echo '🔄 Starting containers with new image...'
+        sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+          -f docker/docker-compose-server-131.yaml up -d || { 
+          echo '❌ Failed to start containers'; 
+          exit 1; 
+        }
+        
+        # Wait for initialization
+        echo '⏳ Waiting for containers to initialize (30s)...'
+        sleep 30
+        
+        # Health check script
+        MAX_RETRIES=5
+        SLEEP_SECONDS=15
+        
+        echo '🏥 Performing health checks...'
+        for i in \$(seq 1 \$MAX_RETRIES); do
+          echo \"Check \$i of \$MAX_RETRIES...\"
+          
+          # Check restart counts
+          RESTARTS=\$(sudo -u ${DEPLOY_USER} docker ps -a \
+            --filter 'name=airflow_2.11-mysql_8.0' \
+            --filter 'name=airflow_2.11-scheduler_2' \
+            -q | xargs -I {} sudo -u ${DEPLOY_USER} docker inspect -f '{{.RestartCount}}' {} \
+            | awk '{sum+=\$1} END {print sum+0}')
+          
+          # Check for unhealthy containers
+          UNHEALTHY=\$(sudo -u ${DEPLOY_USER} docker ps \
+            --filter 'name=airflow_2.11-mysql_8.0' \
+            --filter 'name=airflow_2.11-scheduler_2' \
+            --filter 'health=unhealthy' -q)
+          
+          # Check for exited/dead containers
+          EXITED=\$(sudo -u ${DEPLOY_USER} docker ps -a \
+            --filter 'name=airflow_2.11-mysql_8.0' \
+            --filter 'name=airflow_2.11-scheduler_2' \
+            --filter 'status=exited' \
+            --filter 'status=dead' -q)
+          
+          # Count running containers
+          RUNNING_COUNT=\$(sudo -u ${DEPLOY_USER} docker ps \
+            --filter 'name=airflow_2.11-mysql_8.0' \
+            --filter 'name=airflow_2.11-scheduler_2' \
+            --filter 'status=running' -q | wc -l)
+          
+          echo \"  Restart count: \$RESTARTS\"
+          echo \"  Unhealthy containers: \$(echo \$UNHEALTHY | wc -w)\"
+          echo \"  Exited containers: \$(echo \$EXITED | wc -w)\"
+          echo \"  Running containers: \$RUNNING_COUNT / 2\"
+          
+          if [ \"\$RESTARTS\" -eq 0 ] && [ -z \"\$UNHEALTHY\" ] && [ -z \"\$EXITED\" ] && [ \"\$RUNNING_COUNT\" -eq 2 ]; then
+            echo '✅ All containers stable and healthy on Server 131'
+            
+            # Verify scheduler is active
+            SCHEDULER_STATUS=\$(sudo -u ${DEPLOY_USER} docker exec airflow_2.11-scheduler_2 \
+              airflow jobs check --job-type SchedulerJob --hostname \$(hostname) 2>&1 || echo 'FAILED')
+            
+            if echo \"\$SCHEDULER_STATUS\" | grep -qv 'FAILED'; then
+              echo '✅ Scheduler job is active'
+              exit 0
+            else
+              echo '⚠️ Scheduler job check failed, retrying...'
+            fi
+          else
+            echo \"⚠️ Check \$i: containers not ready yet, retrying in \$SLEEP_SECONDS seconds...\"
+            sleep \$SLEEP_SECONDS
+          fi
+          
+          if [ \"\$i\" -eq \"\$MAX_RETRIES\" ]; then
+            echo '❌ Deployment failed: containers unstable or unhealthy after retries'
+            
+            # Print container logs for debugging
+            echo '📋 Container logs:'
+            sudo -u ${DEPLOY_USER} docker logs --tail 50 airflow_2.11-scheduler_2 2>&1 || true
+            sudo -u ${DEPLOY_USER} docker logs --tail 50 airflow_2.11-mysql_8.0 2>&1 || true
+            
+            exit 1
+          fi
+        done
+      " || { echo "❌ Deployment failed on Server 131"; exit 1; }
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 6: Pull Image and Deploy on Server 130
+# =============================================================================
+deploy-server-130:
+  stage: deploy-server-130
+  script:
+    - echo "🚀 Deploying Airflow on Server 130..."
+    - |
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        
+        # Login to Nexus
+        echo '🔐 Logging into Nexus registry...'
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY} || { echo '❌ Failed to login to Nexus'; exit 1; }
+        
+        # Pull temp image from Nexus
+        echo '📥 Pulling temp image from Nexus...'
+        sudo -u ${DEPLOY_USER} docker pull \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp || { 
+          echo '❌ Failed to pull image from Nexus'; 
+          exit 1; 
+        }
+        
+        echo '✅ Image pulled successfully'
+        
+        # Tag locally for easier reference
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp \
+          ${IMAGE_NAME}:${IMAGE_TAG}-temp
+        
+        # Set environment variables for docker-compose
+        export CUSTOM_IMAGE_NAME='${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}'
+        export CUSTOM_IMAGE_TAG='${IMAGE_TAG}-temp'
+        
+        # Stop existing containers
+        echo '⏸️ Stopping existing containers...'
+        sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+          -f docker/docker-compose-server-130.yaml down || true
+        
+        # Start new containers
+        echo '🔄 Starting containers with new image...'
+        sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+          -f docker/docker-compose-server-130.yaml up -d || { 
+          echo '❌ Failed to start containers'; 
+          exit 1; 
+        }
+        
+        # Wait for initialization
+        echo '⏳ Waiting for containers to initialize (30s)...'
+        sleep 30
+        
+        # Health check script
+        MAX_RETRIES=5
+        SLEEP_SECONDS=15
+        
+        echo '🏥 Performing health checks...'
+        for i in \$(seq 1 \$MAX_RETRIES); do
+          echo \"Check \$i of \$MAX_RETRIES...\"
+          
+          # Check restart counts
+          RESTARTS=\$(sudo -u ${DEPLOY_USER} docker ps -a \
+            --filter 'name=airflow_2.11-webserver' \
+            --filter 'name=airflow_2.11-scheduler_1' \
+            -q | xargs -I {} sudo -u ${DEPLOY_USER} docker inspect -f '{{.RestartCount}}' {} \
+            | awk '{sum+=\$1} END {print sum+0}')
+          
+          # Check for unhealthy containers
+          UNHEALTHY=\$(sudo -u ${DEPLOY_USER} docker ps \
+            --filter 'name=airflow_2.11-webserver' \
+            --filter 'name=airflow_2.11-scheduler_1' \
+            --filter 'health=unhealthy' -q)
+          
+          # Check for exited/dead containers
+          EXITED=\$(sudo -u ${DEPLOY_USER} docker ps -a \
+            --filter 'name=airflow_2.11-webserver' \
+            --filter 'name=airflow_2.11-scheduler_1' \
+            --filter 'status=exited' \
+            --filter 'status=dead' -q)
+          
+          # Count running containers
+          RUNNING_COUNT=\$(sudo -u ${DEPLOY_USER} docker ps \
+            --filter 'name=airflow_2.11-webserver' \
+            --filter 'name=airflow_2.11-scheduler_1' \
+            --filter 'status=running' -q | wc -l)
+          
+          echo \"  Restart count: \$RESTARTS\"
+          echo \"  Unhealthy containers: \$(echo \$UNHEALTHY | wc -w)\"
+          echo \"  Exited containers: \$(echo \$EXITED | wc -w)\"
+          echo \"  Running containers: \$RUNNING_COUNT / 2\"
+          
+          if [ \"\$RESTARTS\" -eq 0 ] && [ -z \"\$UNHEALTHY\" ] && [ -z \"\$EXITED\" ] && [ \"\$RUNNING_COUNT\" -eq 2 ]; then
+            echo '✅ All containers stable and healthy on Server 130'
+            
+            # Verify webserver is responding
+            WEBSERVER_STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://10.10.17.130:39100/health || echo '000')
+            
+            # Verify scheduler is active
+            SCHEDULER_STATUS=\$(sudo -u ${DEPLOY_USER} docker exec airflow_2.11-scheduler_1 \
+              airflow jobs check --job-type SchedulerJob --hostname \$(hostname) 2>&1 || echo 'FAILED')
+            
+            if [ \"\$WEBSERVER_STATUS\" = \"200\" ] && echo \"\$SCHEDULER_STATUS\" | grep -qv 'FAILED'; then
+              echo \"✅ Webserver responding (HTTP \$WEBSERVER_STATUS)\"
+              echo '✅ Scheduler job is active'
+              exit 0
+            else
+              echo \"⚠️ Webserver status: \$WEBSERVER_STATUS (expected 200)\"
+              echo \"⚠️ Scheduler status check failed, retrying...\"
+            fi
+          else
+            echo \"⚠️ Check \$i: containers not ready yet, retrying in \$SLEEP_SECONDS seconds...\"
+            sleep \$SLEEP_SECONDS
+          fi
+          
+          if [ \"\$i\" -eq \"\$MAX_RETRIES\" ]; then
+            echo '❌ Deployment failed: containers unstable or unhealthy after retries'
+            
+            # Print container logs for debugging
+            echo '📋 Container logs:'
+            sudo -u ${DEPLOY_USER} docker logs --tail 50 airflow_2.11-webserver 2>&1 || true
+            sudo -u ${DEPLOY_USER} docker logs --tail 50 airflow_2.11-scheduler_1 2>&1 || true
+            
+            exit 1
+          fi
+        done
+      " || { echo "❌ Deployment failed on Server 130"; exit 1; }
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 7: Promote Image to Stable in Nexus
+# =============================================================================
+promote-image-to-stable:
+  stage: promote-image
+  script:
+    - echo "🎉 Promoting temp image to stable in Nexus..."
+    - |
+      # Promote on Server 131 (can be done from either server)
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        # Login to Nexus
+        echo '🔐 Logging into Nexus registry...'
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY}
+        
+        # Pull the temp image (if not already local)
+        sudo -u ${DEPLOY_USER} docker pull \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp 2>/dev/null || true
+        
+        # Tag as stable
+        echo '🏷️ Tagging image as stable...'
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable
+        
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-temp \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest-stable
+        
+        # Push stable tags to Nexus
+        echo '📤 Pushing stable image to Nexus...'
+        sudo -u ${DEPLOY_USER} docker push \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable
+        
+        sudo -u ${DEPLOY_USER} docker push \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest-stable
+        
+        echo '✅ Image promoted to stable in Nexus'
+        echo \"📝 Stable image: ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable\"
+        
+        # Update local tags on Server 131
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable \
+          ${IMAGE_NAME}:${IMAGE_TAG}-stable
+        
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable \
+          ${IMAGE_NAME}:latest-stable
+      "
+      
+      # Update tags on Server 130
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        # Login to Nexus
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY}
+        
+        # Pull stable image
+        sudo -u ${DEPLOY_USER} docker pull \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable
+        
+        # Update local tags on Server 130
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable \
+          ${IMAGE_NAME}:${IMAGE_TAG}-stable
+        
+        sudo -u ${DEPLOY_USER} docker tag \
+          ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable \
+          ${IMAGE_NAME}:latest-stable
+        
+        echo '✅ Stable image tagged on Server 130'
+      "
+      
+      echo "✅ Deployment completed successfully!"
+      echo "📝 Stable Image: ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:${IMAGE_TAG}-stable"
+      echo "📝 Commit: ${CI_COMMIT_SHA}"
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 8: Cleanup Temp Image from Nexus (Success Path)
+# =============================================================================
+cleanup-temp-image:
+  stage: cleanup-temp
+  when: on_success
+  script:
+    - echo "🧹 Cleaning up temp image from Nexus..."
+    - |
+      # Delete temp tag from Nexus
+      # Note: This requires Nexus API access or manual cleanup
+      # Uncomment and configure based on your Nexus setup
+      
+      # Option 1: Using Nexus REST API
+      # curl -X DELETE -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} \
+      #   "https://${NEXUS_REGISTRY}/service/rest/v1/components?repository=${NEXUS_REPO}&name=${IMAGE_NAME}&version=${IMAGE_TAG}-temp"
+      
+      # Option 2: Keep temp images for audit (recommended)
+      echo "📝 Keeping temp image for audit trail: ${IMAGE_TAG}-temp"
+      echo "💡 Configure Nexus cleanup policies to auto-delete old temp images"
+      
+      # Cleanup old temp images on servers (keep last 3)
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        echo '🧹 Cleaning up old temp images on Server 131...'
+        sudo -u ${DEPLOY_USER} docker images | grep '${IMAGE_NAME}' | grep 'temp' | tail -n +4 | awk '{print \$3}' | xargs -r sudo -u ${DEPLOY_USER} docker rmi -f || true
+        sudo -u ${DEPLOY_USER} docker image prune -f
+      "
+      
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        echo '🧹 Cleaning up old temp images on Server 130...'
+        sudo -u ${DEPLOY_USER} docker images | grep '${IMAGE_NAME}' | grep 'temp' | tail -n +4 | awk '{print \$3}' | xargs -r sudo -u ${DEPLOY_USER} docker rmi -f || true
+        sudo -u ${DEPLOY_USER} docker image prune -f
+      "
+      
+      echo "✅ Cleanup completed"
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
+
+# =============================================================================
+# Stage 9: Automatic Rollback (on failure)
+# =============================================================================
+rollback-on-failure:
+  stage: rollback
+  when: on_failure
+  script:
+    - echo "🔄 Rolling back deployment and cleaning up temp image..."
+    - |
+      # Delete temp image from Nexus (since deployment failed)
+      echo "🗑️ Deleting failed temp image from Nexus..."
+      # Uncomment based on your Nexus setup
+      # curl -X DELETE -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} \
+      #   "https://${NEXUS_REGISTRY}/service/rest/v1/components?repository=${NEXUS_REPO}&name=${IMAGE_NAME}&version=${IMAGE_TAG}-temp"
+      
+      echo "⚠️ Note: Temp image cleanup from Nexus may require manual intervention"
+      
+      # Rollback Server 131
+      echo "⏪ Rolling back Server 131..."
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_131_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        
+        # Revert code
+        PREV_COMMIT=\$(git rev-parse HEAD~1)
+        echo \"Rolling back code to commit: \$PREV_COMMIT\"
+        git checkout \$PREV_COMMIT || { echo '❌ Failed to checkout previous commit'; exit 1; }
+        
+        # Login to Nexus
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY}
+        
+        # Pull latest stable image from Nexus
+        if sudo -u ${DEPLOY_USER} docker pull ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest-stable; then
+          echo 'Found stable image in Nexus'
+          
+          export CUSTOM_IMAGE_NAME='${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}'
+          export CUSTOM_IMAGE_TAG='latest-stable'
+          
+          sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+            -f docker/docker-compose-server-131.yaml down
+          
+          sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+            -f docker/docker-compose-server-131.yaml up -d
+          
+          echo '✅ Server 131 rolled back to stable image from Nexus'
+        else
+          echo '⚠️ No stable image found in Nexus'
+          exit 1
+        fi
+      " || echo "⚠️ Rollback on Server 131 encountered issues"
+      
+      # Rollback Server 130
+      echo "⏪ Rolling back Server 130..."
+      ssh -p${SSH_PORT} -i ${SSH_KEY} ${SSH_USER}@${SERVER_130_HOST} "
+        cd ${CODE_BASE_PATH} &&
+        
+        # Revert code
+        PREV_COMMIT=\$(git rev-parse HEAD~1)
+        echo \"Rolling back code to commit: \$PREV_COMMIT\"
+        git checkout \$PREV_COMMIT || { echo '❌ Failed to checkout previous commit'; exit 1; }
+        
+        # Login to Nexus
+        echo '${NEXUS_PASSWORD}' | sudo -u ${DEPLOY_USER} docker login \
+          -u '${NEXUS_USERNAME}' \
+          --password-stdin \
+          ${NEXUS_REGISTRY}
+        
+        # Pull latest stable image from Nexus
+        if sudo -u ${DEPLOY_USER} docker pull ${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}:latest-stable; then
+          echo 'Found stable image in Nexus'
+          
+          export CUSTOM_IMAGE_NAME='${NEXUS_REGISTRY}/${NEXUS_REPO}/${IMAGE_NAME}'
+          export CUSTOM_IMAGE_TAG='latest-stable'
+          
+          sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+            -f docker/docker-compose-server-130.yaml down
+          
+          sudo -u ${DEPLOY_USER} ${DOCKER_COMPOSE_BIN} \
+            -f docker/docker-compose-server-130.yaml up -d
+          
+          echo '✅ Server 130 rolled back to stable image from Nexus'
+        else
+          echo '⚠️ No stable image found in Nexus'
+          exit 1
+        fi
+      " || echo "⚠️ Rollback on Server 130 encountered issues"
+      
+      echo "❌ Deployment failed and rollback completed"
+      echo "📝 Temp image ${IMAGE_TAG}-temp should be cleaned up from Nexus"
+      exit 1
+  rules:
+    - changes:
+        - airflow/docker/**
+        - airflow/config/**
+        - airflow/dags/**
+        - airflow/airflow-ci.yml
